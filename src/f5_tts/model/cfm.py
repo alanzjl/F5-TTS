@@ -100,6 +100,10 @@ class CFM(nn.Module):
         self.eval()
         # raw wave
 
+        # Verify that we are only using one duration.
+        # Current hack in batched inference will break if we use different durations.
+        assert isinstance(duration, int), "Batch inference only supports one duration per sample batch."
+
         if cond.ndim == 2:
             cond = self.mel_spec(cond)
             cond = cond.permute(0, 2, 1)
@@ -154,23 +158,6 @@ class CFM(nn.Module):
         else:  # save memory and speed up, as single inference need no mask currently
             mask = None
 
-        # neural ode
-
-        def fn(t, x):
-            # at each step, conditioning is fixed
-            # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
-
-            # predict flow
-            pred = self.transformer(
-                x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=False, drop_text=False, cache=True
-            )
-            if cfg_strength < 1e-5:
-                return pred
-
-            null_pred = self.transformer(
-                x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=True, drop_text=True, cache=True
-            )
-            return pred + (pred - null_pred) * cfg_strength
 
         # noise input
         # to make sure batch inference result is same with different batch size, and for sure single inference
@@ -181,6 +168,12 @@ class CFM(nn.Module):
                 torch.manual_seed(seed)
             y0.append(torch.randn(dur, self.num_channels, device=self.device, dtype=step_cond.dtype))
         y0 = pad_sequence(y0, padding_value=0, batch_first=True)
+
+        # create a mask of the same shape as y0
+        # fill_mask = torch.zeros_like(y0).bool()
+        # for i, dur in enumerate(duration):
+        #     fill_mask[i, :dur] = True
+        # fill_mask = fill_mask.to(self.device)
 
         t_start = 0
 
@@ -193,6 +186,29 @@ class CFM(nn.Module):
         t = torch.linspace(t_start, 1, steps + 1, device=self.device, dtype=step_cond.dtype)
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+        
+        # TODO: Alan's hack here. had to remove mask to get batch inference not eating parts of the audio
+        mask = None
+        
+        # neural ode
+        def fn(t, x):
+            # at each step, conditioning is fixed
+            # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
+
+            # predict flow
+            pred = self.transformer(
+                x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=False, drop_text=False, cache=True
+            )
+
+            if cfg_strength < 1e-5:
+                flow = pred
+            else:
+                null_pred = self.transformer(
+                    x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=True, drop_text=True, cache=True
+                )
+                flow = pred + (pred - null_pred) * cfg_strength
+            # flow_masked = torch.where(fill_mask, flow, torch.zeros_like(flow))
+            return flow
 
         trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
         self.transformer.clear_cache()
@@ -206,6 +222,7 @@ class CFM(nn.Module):
             out = vocoder(out)
 
         return out, trajectory
+
 
     def forward(
         self,
